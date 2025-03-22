@@ -13,12 +13,22 @@ from tools.audio import load_audio
 llm_api_key = 'llama3.1'
 llm_client = openai.OpenAI(api_key=llm_api_key, base_url='http://localhost:11434/v1')
 
-def llm_chat(user_query):
-    """与 LLM 对话并获取回复"""
+def llm_chat(user_query, language="zh"):
+    """与 LLM 对话并获取回复
+    
+    Args:
+        user_query: 用户查询文本
+        language: 目标语言，默认中文
+    """
+    # 根据语言设置系统提示
+    system_content = """You are a chatbot, reply me always briefly in plain text in Chinese, no non-text content allowed"""
+    if language != "zh":
+        system_content = """You are a chatbot, reply me always briefly in plain text in English, no non-text content allowed"""
+    
     response = llm_client.chat.completions.create(
         model="llama3.1",
         messages=[
-            {"role": "system", "content": """You are a chatbot, reply me always briefly in plain text in Chinese, no non-text content allowed"""},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_query}
         ],
         temperature=0.5,
@@ -177,7 +187,8 @@ def main(
         speech_rate=1.0,           # 语音速率，1.0为正常速度
         noise_reduction=True,      # 是否进行降噪处理
         voice_pitch=0.0,           # 音高调整，0为正常音高
-        force_extract=False        # 是否强制重新提取语音特征
+        force_extract=False,       # 是否强制重新提取语音特征
+        language="zh"              # 目标语言，默认中文
     ):
     """
     主函数，可通过参数控制生成行为
@@ -193,6 +204,7 @@ def main(
         noise_reduction (bool): 是否进行降噪处理
         voice_pitch (float): 音高调整，0为正常音高
         force_extract (bool): 是否强制重新提取语音特征
+        language (str): 目标语言，默认"zh"表示中文
     """
     try:
         # 设置CUDA内存分配策略，减少内存碎片
@@ -209,7 +221,7 @@ def main(
         
         # 向 LLM 发送请求
         print("向 LLM 发送请求...")
-        say = llm_chat(llm_input)
+        say = llm_chat(llm_input, language)
         print(f"LLM 回复: {say}")
         
         # 加载或提取语音特征
@@ -256,22 +268,37 @@ def main(
         print("创建声音克隆参数...")
         free_memory()
         
+        # 准备双语言处理 - 添加语言标记
+        # 为LLM生成的中文文本添加明确的语言标记以帮助模型切换语言
+        # [ZH]标记表明这是中文内容
+        say_with_lang = f"[ZH] {say}" if language == "zh" else say
+        
         # 注意：根据 core.py 调整参数，可能有更多自定义选项
-        params_infer_code = ChatTTS.Chat.InferCodeParams(
-            spk_smp=spk_smp,
-            txt_smp=exact_transcript,
-            # 以下参数需根据 core.py 的内容确认是否支持
-            # speech_rate=speech_rate,            # 语速控制
-            # noise_reduction=noise_reduction,    # 降噪控制  
-            # voice_pitch=voice_pitch             # 音高控制
-        )
+        try:
+            # 尝试添加语言参数
+            params_infer_code = ChatTTS.Chat.InferCodeParams(
+                spk_smp=spk_smp,
+                txt_smp=exact_transcript,
+                language=language,  # 尝试传递语言参数
+                # 以下参数需根据 core.py 的内容确认是否支持
+                # speech_rate=speech_rate,            # 语速控制
+                # noise_reduction=noise_reduction,    # 降噪控制  
+                # voice_pitch=voice_pitch             # 音高控制
+            )
+        except TypeError:
+            # 如果不支持language参数，则使用基本参数
+            params_infer_code = ChatTTS.Chat.InferCodeParams(
+                spk_smp=spk_smp,
+                txt_smp=exact_transcript
+            )
+            print("注意: 模型不支持language参数，使用标记方式代替")
         
         # 生成克隆语音
         print("生成克隆语音...")
         free_memory()
         
-        # 智能分段处理
-        text_segments = smart_text_segmentation(say, max_segment_length)
+        # 使用带语言标记的文本进行分段
+        text_segments = smart_text_segmentation(say_with_lang, max_segment_length)
         
         if len(text_segments) > 1:
             print(f"文本已智能分段为{len(text_segments)}个片段")
@@ -280,15 +307,20 @@ def main(
             for i, segment in enumerate(text_segments):
                 print(f"处理文本段 {i+1}/{len(text_segments)}: {segment[:20]}...")
                 
-                # 注意：infer方法可能支持更多参数，根据core.py确认
-                seg_wav = chat.infer(
-                    segment,
-                    params_infer_code=params_infer_code
-                    # 可能的其他参数
-                    # speech_rate=speech_rate,
-                    # noise_reduction=noise_reduction,
-                    # voice_pitch=voice_pitch
-                )
+                # 尝试用多种方式设置语言参数
+                try:
+                    # 方法1：直接在infer时设置language参数
+                    seg_wav = chat.infer(
+                        segment,
+                        params_infer_code=params_infer_code,
+                        language=language
+                    )
+                except TypeError:
+                    # 方法2：如果不支持language参数，只使用基本参数
+                    seg_wav = chat.infer(
+                        segment,
+                        params_infer_code=params_infer_code
+                    )
                 
                 if isinstance(seg_wav, list) and len(seg_wav) > 0:
                     all_cloned_wavs.append(seg_wav[0])
@@ -317,15 +349,21 @@ def main(
             else:
                 cloned_wav = None
         else:
-            # 注意：infer方法可能支持更多参数，根据core.py确认
-            cloned_wav = chat.infer(
-                say,
-                params_infer_code=params_infer_code
-                # 可能的其他参数
-                # speech_rate=speech_rate,
-                # noise_reduction=noise_reduction,
-                # voice_pitch=voice_pitch
-            )
+            # 尝试用多种方式设置语言参数
+            try:
+                # 方法1：直接在infer时设置language参数
+                cloned_wav = chat.infer(
+                    say_with_lang,  # 使用带语言标记的文本
+                    params_infer_code=params_infer_code,
+                    language=language  # 尝试直接传递语言参数
+                )
+            except TypeError:
+                # 方法2：如果不支持language参数，只使用基本参数
+                cloned_wav = chat.infer(
+                    say_with_lang,  # 使用带语言标记的文本
+                    params_infer_code=params_infer_code
+                )
+            
             if isinstance(cloned_wav, list) and len(cloned_wav) > 0:
                 cloned_wav = cloned_wav[0]
         
@@ -354,8 +392,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="output_cloned_voice.wav", help="克隆语音输出路径")
     parser.add_argument("--force-extract", action="store_true", help="强制重新提取语音特征")
     parser.add_argument("--speech-rate", type=float, default=1.0, help="语音速率(0.5-2.0)")
-    parser.add_argument("--no-noise-reduction", action="store_false", dest="noise_reduction", help="禁用降噪处理")
+    parser.add_argument("--no-noise-reduction", action="store_true", dest="noise_reduction", help="禁用降噪处理")
     parser.add_argument("--voice-pitch", type=float, default=0.0, help="音高调整(-1.0到1.0)")
+    parser.add_argument("--language", type=str, default="zh", help="目标语言(zh:中文, en:英文)")
     
     args = parser.parse_args()
     
@@ -370,5 +409,6 @@ if __name__ == "__main__":
         speech_rate=args.speech_rate,
         noise_reduction=args.noise_reduction,
         voice_pitch=args.voice_pitch,
-        force_extract=args.force_extract
+        force_extract=args.force_extract,
+        language=args.language
     )
