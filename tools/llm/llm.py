@@ -52,23 +52,92 @@ prompt_dict = {
 }
 
 
+import aiohttp
+import backoff
+import asyncio
+import json
+from typing import Dict, Optional
+import logging
+
 class ChatOpenAI:
-    def __init__(self, api_key, base_url, model):
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
+    """处理本地LLM对话的客户端类"""
+    
+    def __init__(self, base_url: str, model: str):
+        """
+        初始化ChatOpenAI客户端
+        
+        参数:
+            base_url: API基础URL
+            model: 要使用的模型名称
+        """
+        self.base_url = base_url
         self.model = model
-
-    def call(self, user_question, temperature=0.3, prompt_version="kimi", **kwargs):
-
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=prompt_dict[prompt_version]
-            + [
-                {"role": "user", "content": user_question},
-            ],
-            temperature=temperature,
-            **kwargs
-        )
-        return completion.choices[0].message.content
+        self.logger = logging.getLogger("ChatTTS_GUI.LLM")
+        
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, asyncio.TimeoutError),
+        max_tries=3,
+        max_time=30
+    )
+    async def async_call(self, user_input: str, system_prompt: Optional[str] = None) -> str:
+        """
+        异步调用LLM获取回答
+        
+        参数:
+            user_input: 用户输入文本
+            system_prompt: 系统提示（可选）
+            
+        返回:
+            LLM的回答文本
+        """
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+            
+        messages.append({"role": "user", "content": user_input})
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/chat",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "stream": False
+                    }
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data['message']['content']
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"API Error: {response.status} - {error_text}")
+                        
+        except Exception as e:
+            self.logger.error(f"Error in LLM call: {str(e)}")
+            raise
+            
+    def call(self, user_input: str, system_prompt: Optional[str] = None) -> str:
+        """
+        同步调用LLM获取回答（在内部使用异步调用）
+        
+        参数:
+            user_input: 用户输入文本
+            system_prompt: 系统提示（可选）
+            
+        返回:
+            LLM的回答文本
+        """
+        # 创建事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # 在事件循环中运行异步调用
+            response = loop.run_until_complete(self.async_call(user_input, system_prompt))
+            return response
+        finally:
+            # 关闭事件循环
+            loop.close()
