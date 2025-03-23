@@ -37,7 +37,7 @@ def llm_chat(user_query, language="zh"):
     return response.choices[0].message.content
 
 def normalize_audio(audio_data, target_level=-23.0):
-    """标准化音频电平"""
+    """增强版音频标准化（增加动态范围压缩）"""
     if torch.is_tensor(audio_data):
         audio_np = audio_data.cpu().numpy()
     else:
@@ -52,6 +52,10 @@ def normalize_audio(audio_data, target_level=-23.0):
     
     # 应用增益
     normalized_audio = audio_np * gain
+    
+    # 增加动态范围压缩
+    compressed_audio = np.tanh(normalized_audio * 0.8) * 0.95
+    normalized_audio = compressed_audio * 0.7 + normalized_audio * 0.3
     
     # 防止削波(clipping)
     if np.max(np.abs(normalized_audio)) > 0.99:
@@ -254,10 +258,18 @@ def main(
             
             # 降低音频处理的批量大小或分段处理
             # 如果样本较长，可以考虑只使用前10秒
-            max_len = 24000 * 10  # 10秒的音频
+            max_len = 24000 * 30  # 延长到30秒高质量样本
             if len(audio_data) > max_len:
-                audio_data = audio_data[:max_len]
+                # 取中间部分避免开头/结尾的静音
+                start = len(audio_data) // 4
+                audio_data = audio_data[start:start+max_len]
             
+            # 增加样本预处理
+            print("预处理样本音频...")
+            audio_data = chat.preprocess_audio(audio_data, 
+                                              noise_reduction=True,
+                                              target_loudness=-18.0,
+                                              remove_silence=True)  # 新增静音去除
             spk_smp = chat.sample_audio_speaker(audio_data)
             print("成功提取语音特征")
             
@@ -278,18 +290,23 @@ def main(
             # 尝试添加语言参数
             params_infer_code = ChatTTS.Chat.InferCodeParams(
                 spk_smp=spk_smp,
-                txt_smp=exact_transcript,
+                txt_smp=say_with_lang,
                 language=language,  # 尝试传递语言参数
-                # 以下参数需根据 core.py 的内容确认是否支持
-                # speech_rate=speech_rate,            # 语速控制
-                # noise_reduction=noise_reduction,    # 降噪控制  
+                speech_rate=speech_rate,            # 启用语速控制
+                noise_reduction_level=2,           # 增强降噪等级
+                voice_stability=0.9,               # 新增声音稳定性参数
+                voice_smoothness=0.8,              # 新增语音平滑参数
                 # voice_pitch=voice_pitch             # 音高控制
             )
         except TypeError:
             # 如果不支持language参数，则使用基本参数
             params_infer_code = ChatTTS.Chat.InferCodeParams(
                 spk_smp=spk_smp,
-                txt_smp=exact_transcript
+                txt_smp=say_with_lang,
+                speech_rate=speech_rate * 0.9,     # 降低语速提升清晰度 
+                voice_smoothness=0.85,
+                voice_stability=0.95,
+                noise_reduction=noise_reduction
             )
             print("注意: 模型不支持language参数，使用标记方式代替")
         
@@ -368,6 +385,17 @@ def main(
                 cloned_wav = cloned_wav[0]
         
         if cloned_wav is not None and len(cloned_wav) > 0:
+            # 增加最终降噪处理
+            if noise_reduction:
+                print("应用最终降噪处理...")
+                cloned_wav = chat.denoise_audio(
+                    cloned_wav,
+                    noise_level=0.03,             # 增强降噪强度
+                    preserve_voice=0.95,          # 优化人声保留
+                    spectral_gating=True,         # 新增频谱门控
+                    residual_noise_filter=0.1     # 残留噪声过滤
+                )
+            
             save_wav(cloned_wav, 24000, output_path)
             print("成功生成克隆语音!")
         else:
